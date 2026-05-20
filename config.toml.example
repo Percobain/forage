@@ -1,0 +1,31 @@
+[general]
+cache_db = "~/.forage/cache.db"
+cookies_dir = "~/.forage/cookies"
+log_level = "info"
+default_cache_ttl_seconds = 86400  # 24hr
+
+[fetch]
+direct_user_agent_profile = "chrome_120"
+default_timeout_seconds = 30
+parallel_concurrency = 10
+jina_api_key = ""  # optional, increases rate limit to 2k RPM
+
+[rate_limits]
+linkedin_min_delay_ms = 8000
+linkedin_max_delay_ms = 15000
+linkedin_daily_cap = 80
+x_min_delay_ms = 6000
+x_max_delay_ms = 12000
+x_daily_cap = 200
+instagram_min_delay_ms = 12000
+instagram_max_delay_ms = 20000
+instagram_daily_cap = 60
+
+[apollo]
+api_key = ""
+
+[bing]
+api_key = ""
+
+[mcp]
+transport = "stdio"
