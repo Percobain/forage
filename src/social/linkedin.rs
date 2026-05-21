@@ -159,8 +159,8 @@ fn parse_cookie_file(content: &str) -> Result<Vec<CookieEntry>, FetchError> {
 }
 
 pub struct LinkedInClient {
-    li_at: String,
-    jsessionid: String,
+    cookie_header: String,
+    csrf_token: String,
     client: reqwest::Client,
 }
 
@@ -171,29 +171,37 @@ impl LinkedInClient {
 
         let cookies = parse_cookie_file(&content)?;
 
-        let li_at = cookies
-            .iter()
-            .find(|c| c.name == "li_at")
-            .ok_or_else(|| FetchError::HttpError(
+        // Verify li_at exists
+        if !cookies.iter().any(|c| c.name == "li_at") {
+            return Err(FetchError::HttpError(
                 "LinkedIn cookie missing 'li_at'. Re-export cookies from browser.".to_string(),
-            ))?
-            .value
-            .clone();
+            ));
+        }
 
-        let jsessionid = cookies
+        let csrf_token = cookies
             .iter()
             .find(|c| c.name == "JSESSIONID")
-            .map(|c| c.value.clone())
+            .map(|c| c.value.trim_matches('"').to_string())
             .unwrap_or_default();
+
+        // Send ALL cookies — LinkedIn validates more than just li_at
+        let cookie_header = cookies
+            .iter()
+            .map(|c| format!("{}={}", c.name, c.value))
+            .collect::<Vec<_>>()
+            .join("; ");
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| FetchError::HttpError(e.to_string()))?;
 
-        Ok(Self { li_at, jsessionid, client })
+        Ok(Self { cookie_header, csrf_token, client })
     }
 
+    /// Fetch a LinkedIn profile by loading the web page with cookies
+    /// (like a real browser) and extracting data from embedded JSON.
     pub async fn fetch_profile(
         &self,
         profile_url: &str,
@@ -202,34 +210,50 @@ impl LinkedInClient {
         limiter.acquire().await.map_err(|e| FetchError::HttpError(e.to_string()))?;
 
         let username = extract_username(profile_url);
-
-        let api_url = format!(
-            "https://www.linkedin.com/voyager/api/identity/dash/profiles?q=memberIdentity&memberIdentity={username}&decorationId=com.linkedin.voyager.dash.deco.identity.profile.WebTopCardCore-20"
-        );
+        let page_url = format!("https://www.linkedin.com/in/{username}/");
 
         let response = self.client
-            .get(&api_url)
-            .header("cookie", format!("li_at={}; JSESSIONID={}", self.li_at, self.jsessionid))
-            .header("csrf-token", self.jsessionid.trim_matches('"'))
-            .header("accept", "application/vnd.linkedin.normalized+json+2.1")
-            .header("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            .header("x-li-lang", "en_US")
-            .header("x-restli-protocol-version", "2.0.0")
+            .get(&page_url)
+            .header("cookie", &self.cookie_header)
+            .header("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .header("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("accept-language", "en-US,en;q=0.9")
+            .header("sec-fetch-dest", "document")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-site", "none")
+            .header("sec-fetch-user", "?1")
+            .header("upgrade-insecure-requests", "1")
             .send()
             .await
             .map_err(|e| FetchError::HttpError(e.to_string()))?;
 
         let status = response.status().as_u16();
+        if status == 302 || status == 301 {
+            return Err(FetchError::HttpError(
+                "LinkedIn session expired (302 redirect). Re-export cookies from browser.".to_string(),
+            ));
+        }
+        if status == 999 {
+            return Err(FetchError::HttpError(
+                "LinkedIn blocked request (999). Account may need warming up.".to_string(),
+            ));
+        }
         if status != 200 {
             return Err(FetchError::HttpError(format!(
-                "LinkedIn Voyager API returned status {status}"
+                "LinkedIn returned status {status}"
             )));
         }
 
         let body = response.text().await
             .map_err(|e| FetchError::HttpError(e.to_string()))?;
 
-        parse_voyager_profile(&body, &username)
+        if body.len() < 5000 || body.contains("\"authwall\"") {
+            return Err(FetchError::HttpError(
+                "LinkedIn returned auth wall. Re-export cookies from browser.".to_string(),
+            ));
+        }
+
+        Ok(parse_html_profile(&body, &username))
     }
 }
 
@@ -425,6 +449,115 @@ fn parse_profile_markdown(md: &str, url: &str) -> LinkedInProfile {
             }
             _ => {}
         }
+    }
+
+    LinkedInProfile {
+        name,
+        headline,
+        about,
+        experience,
+        education,
+        recent_posts: vec![],
+    }
+}
+
+/// Parse profile data from LinkedIn's HTML page.
+/// LinkedIn embeds profile JSON in <code> tags as serialized data.
+fn parse_html_profile(html: &str, username: &str) -> LinkedInProfile {
+    let mut name = String::new();
+    let mut headline = None;
+    let mut about = None;
+    let mut experience = Vec::new();
+    let mut education = Vec::new();
+
+    // LinkedIn embeds data in <code> tags with JSON containing "included" arrays
+    let doc = scraper::Html::parse_document(html);
+    let code_sel = scraper::Selector::parse("code").unwrap();
+
+    for code_el in doc.select(&code_sel) {
+        let text = code_el.text().collect::<String>();
+        if !text.contains("firstName") || !text.contains("lastName") {
+            continue;
+        }
+
+        // Decode HTML entities
+        let decoded = text
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">");
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&decoded) {
+            if let Some(included) = json.get("included").and_then(|v| v.as_array()) {
+                for item in included {
+                    // Extract name and headline
+                    if let (Some(fn_val), Some(ln_val)) = (
+                        item.get("firstName").and_then(|v| v.as_str()),
+                        item.get("lastName").and_then(|v| v.as_str()),
+                    ) {
+                        if !fn_val.is_empty() && !ln_val.is_empty() && name.is_empty() {
+                            name = format!("{fn_val} {ln_val}");
+                        }
+                    }
+
+                    if headline.is_none() {
+                        if let Some(h) = item.get("headline").and_then(|v| v.as_str()) {
+                            if !h.is_empty() {
+                                headline = Some(h.to_string());
+                            }
+                        }
+                    }
+
+                    if about.is_none() {
+                        if let Some(s) = item.get("summary").and_then(|v| v.as_str()) {
+                            if !s.is_empty() {
+                                about = Some(s.to_string());
+                            }
+                        }
+                    }
+
+                    // Experience entries
+                    if let Some(company) = item.get("companyName").and_then(|v| v.as_str()) {
+                        if let Some(title) = item.get("title").and_then(|v| v.as_str()) {
+                            experience.push(format!("{title} at {company}"));
+                        }
+                    }
+
+                    // Education entries
+                    if let Some(school) = item.get("schoolName").and_then(|v| v.as_str()) {
+                        if !school.is_empty() {
+                            education.push(school.to_string());
+                        }
+                    }
+                }
+            }
+
+            if !name.is_empty() {
+                break; // Found what we need
+            }
+        }
+    }
+
+    // Fallback: try to extract from meta tags / title
+    if name.is_empty() {
+        let title_sel = scraper::Selector::parse("title").unwrap();
+        if let Some(title_el) = doc.select(&title_sel).next() {
+            let title_text = title_el.text().collect::<String>();
+            // LinkedIn titles are like "Shreyans Tatiya - Something | LinkedIn"
+            if let Some(dash_pos) = title_text.find(" - ") {
+                name = title_text[..dash_pos].trim().to_string();
+                if headline.is_none() {
+                    let rest = &title_text[dash_pos + 3..];
+                    if let Some(pipe_pos) = rest.find(" | ") {
+                        headline = Some(rest[..pipe_pos].trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if name.is_empty() {
+        name = username.to_string();
     }
 
     LinkedInProfile {

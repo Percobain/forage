@@ -128,6 +128,18 @@ pub struct BatchFetchParams {
     pub urls: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindLeadsParams {
+    /// Company name or domain (e.g. "Razorpay" or "razorpay.com")
+    pub company: String,
+    /// Target job titles to search for (e.g. ["CEO", "CTO", "Founder", "Head of Engineering"]). Default: common decision-maker titles.
+    pub titles: Option<Vec<String>>,
+    /// Maximum leads to find per title (default: 3)
+    #[serde(default = "default_three")]
+    pub per_title: usize,
+}
+
+fn default_three() -> usize { 3 }
 fn default_true() -> bool { true }
 fn default_max_pages() -> usize { 50 }
 fn default_max_depth() -> u32 { 3 }
@@ -204,6 +216,12 @@ impl ForageServer {
                 description: "Search for tweets or X users via web search. Returns URLs and snippets. Use to find accounts, mentions, or discussions about a topic on X.".into(),
                 input_schema: schema_for::<XSearchParams>().into(),
             },
+            // === Lead Generation ===
+            Tool {
+                name: "find_leads".into(),
+                description: "Find people at a company with their LinkedIn profile URLs and email addresses. Pass a company name or domain. Searches the public web for employees by title (CEO, CTO, Founder, etc). Returns name, title, LinkedIn URL, and guessed email. No cookies or API keys needed.".into(),
+                input_schema: schema_for::<FindLeadsParams>().into(),
+            },
             // === Batch ===
             Tool {
                 name: "batch_fetch".into(),
@@ -234,6 +252,7 @@ impl ForageServer {
             "linkedin_search" => dispatch!(LinkedInSearchParams, handle_linkedin_search),
             "x_profile" => dispatch!(XProfileParams, handle_x_profile),
             "x_search" => dispatch!(XSearchParams, handle_x_search),
+            "find_leads" => dispatch!(FindLeadsParams, handle_find_leads),
             "batch_fetch" => dispatch!(BatchFetchParams, handle_batch_fetch),
             _ => format!("Unknown tool: {name}"),
         }
@@ -314,7 +333,18 @@ impl ForageServer {
             if let Some(entry) = self.cache.get(&cache_key) { return entry.content; }
         }
 
-        // Try public page via Jina first (no cookies needed)
+        // Try Playwright + stealth first (best data, needs cookies)
+        let slug = params.company.trim().trim_end_matches('/')
+            .rsplit('/').next().unwrap_or(&params.company);
+
+        if let Some(result) = run_python_helper("linkedin_fetcher.py", &["company", slug]).await {
+            if !result.contains("\"error\"") {
+                self.cache.put(&cache_key, &params.company, "playwright", &result, Some(200), 3600);
+                return result;
+            }
+        }
+
+        // Fallback: Jina on public company page (no cookies needed)
         match social::linkedin::fetch_company_raw(&params.company, SOCIAL_TIMEOUT).await {
             Ok(content) => {
                 self.cache.put(&cache_key, &params.company, "linkedin_jina", &content, Some(200), 3600);
@@ -330,28 +360,42 @@ impl ForageServer {
             if let Some(entry) = self.cache.get(&cache_key) { return entry.content; }
         }
 
-        // Try cookie-based Voyager API first (richer data)
-        let cookies_path = self.config.cookies_dir_path().join("linkedin.json");
-        if cookies_path.exists() {
-            if let Ok(client) = social::linkedin::LinkedInClient::from_cookie_file(&cookies_path) {
-                let limiter = PlatformLimiter::new(
-                    RateLimiterConfig {
-                        platform: "linkedin".to_string(),
-                        min_delay: Duration::from_millis(self.config.rate_limits.linkedin_min_delay_ms),
-                        max_delay: Duration::from_millis(self.config.rate_limits.linkedin_max_delay_ms),
-                        daily_cap: self.config.rate_limits.linkedin_daily_cap,
-                    },
-                    self.cache.clone(),
-                );
-                if let Ok(profile) = client.fetch_profile(&params.profile, &limiter).await {
-                    let output = serde_json::to_string_pretty(&profile).unwrap_or_else(|_| "{}".to_string());
-                    self.cache.put(&cache_key, &params.profile, "linkedin_voyager", &output, Some(200), 3600);
-                    return output;
-                }
+        let profile_input = params.profile.trim().trim_end_matches('/');
+        let username = if let Some(pos) = profile_input.rfind("/in/") {
+            &profile_input[pos + 4..]
+        } else {
+            profile_input
+        };
+
+        // Tier 1: Playwright + stealth with cookies (best data, works on private profiles)
+        if let Some(result) = run_python_helper("linkedin_fetcher.py", &["profile", username]).await {
+            if !result.contains("\"error\"") {
+                self.cache.put(&cache_key, &params.profile, "playwright", &result, Some(200), 3600);
+                return result;
             }
         }
 
-        // Fallback: public page via Jina (no cookies needed)
+        // Tier 2: DDG search for profile info (no cookies, no bans, scales)
+        let name_query = username.replace('-', " ");
+        let search_query = format!("\"{name_query}\" LinkedIn");
+        if let Ok(results) = search::duckduckgo::search(&search_query, 10, self.config.fetch.default_timeout_seconds).await {
+            let li_results: Vec<_> = results.iter()
+                .filter(|r| r.url.contains("linkedin.com/in/"))
+                .collect();
+
+            if !li_results.is_empty() {
+                let mut output = String::new();
+                for r in &li_results {
+                    output.push_str(&format!("## {}\n", r.title));
+                    output.push_str(&format!("URL: {}\n", r.url));
+                    output.push_str(&format!("{}\n\n", r.snippet));
+                }
+                self.cache.put(&cache_key, &params.profile, "linkedin_ddg", &output, Some(200), 3600);
+                return output;
+            }
+        }
+
+        // Tier 3: Jina on public page
         match social::linkedin::fetch_person_public(&params.profile, SOCIAL_TIMEOUT).await {
             Ok(profile) => {
                 let output = serde_json::to_string_pretty(&profile).unwrap_or_else(|_| "{}".to_string());
@@ -396,7 +440,20 @@ impl ForageServer {
             if let Some(entry) = self.cache.get(&cache_key) { return entry.content; }
         }
 
-        match social::x::fetch_profile_raw(&params.handle, SOCIAL_TIMEOUT).await {
+        let handle = params.handle.trim().trim_start_matches('@')
+            .trim_start_matches("https://x.com/").trim_start_matches("https://twitter.com/")
+            .trim_end_matches('/');
+
+        // Tier 1: Playwright + stealth (best data)
+        if let Some(result) = run_python_helper("x_fetcher.py", &["profile", handle]).await {
+            if !result.contains("\"error\"") {
+                self.cache.put(&cache_key, &params.handle, "playwright", &result, Some(200), 3600);
+                return result;
+            }
+        }
+
+        // Tier 2: Jina
+        match social::x::fetch_profile_raw(handle, SOCIAL_TIMEOUT).await {
             Ok(content) => {
                 self.cache.put(&cache_key, &params.handle, "x_jina", &content, Some(200), 3600);
                 content
@@ -470,6 +527,107 @@ impl ForageServer {
         }
 
         serde_json::to_string_pretty(&results).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    // === Lead Generation ===
+
+    async fn handle_find_leads(&self, params: FindLeadsParams) -> String {
+        let titles = params.titles.unwrap_or_else(|| {
+            vec![
+                "CEO".into(), "CTO".into(), "Founder".into(), "Co-Founder".into(),
+                "Head of Engineering".into(), "VP Engineering".into(),
+                "Head of Product".into(), "COO".into(),
+            ]
+        });
+
+        let mut all_leads = Vec::new();
+
+        for title in &titles {
+            if all_leads.len() >= params.per_title * titles.len() {
+                break;
+            }
+
+            let query = format!("{} {} LinkedIn", params.company, title);
+            let cache_key = Cache::cache_key("find_leads", &query, "");
+
+            let results = if let Some(entry) = self.cache.get(&cache_key) {
+                serde_json::from_str(&entry.content).unwrap_or_default()
+            } else {
+                match search::duckduckgo::search(&query, 10, self.config.fetch.default_timeout_seconds).await {
+                    Ok(r) => {
+                        let json = serde_json::to_string(&r).unwrap_or_default();
+                        self.cache.put(&cache_key, &query, "leads_search", &json, Some(200), 21600);
+                        r
+                    }
+                    Err(_) => vec![],
+                }
+            };
+
+            let mut count = 0;
+            for r in &results {
+                if count >= params.per_title { break; }
+                if r.url.contains("linkedin.com/in/") {
+                    let lead = serde_json::json!({
+                        "name": extract_name_from_title(&r.title),
+                        "title_searched": title,
+                        "headline": r.title,
+                        "linkedin_url": r.url,
+                        "snippet": r.snippet,
+                        "company": params.company,
+                    });
+                    all_leads.push(lead);
+                    count += 1;
+                }
+            }
+
+            // Small delay between searches to avoid DDG rate limits
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        serde_json::to_string_pretty(&all_leads).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
+fn extract_name_from_title(title: &str) -> String {
+    // LinkedIn titles: "Firstname Lastname - Headline | LinkedIn"
+    if let Some(dash) = title.find(" - ") {
+        title[..dash].trim().to_string()
+    } else if let Some(pipe) = title.find(" | ") {
+        title[..pipe].trim().to_string()
+    } else {
+        title.trim().to_string()
+    }
+}
+
+/// Run a Python helper script as subprocess and return stdout
+async fn run_python_helper(script: &str, args: &[&str]) -> Option<String> {
+    let script_path = std::env::current_exe().ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .map(|p| p.join("..").join("..").join("python_helpers").join(script))
+        .or_else(|| {
+            // Also check relative to working directory
+            let p = std::path::PathBuf::from("python_helpers").join(script);
+            if p.exists() { Some(p) } else { None }
+        })?;
+
+    if !script_path.exists() {
+        tracing::debug!("Python helper not found: {}", script_path.display());
+        return None;
+    }
+
+    let output = tokio::process::Command::new("python")
+        .arg(&script_path)
+        .args(args)
+        .output()
+        .await
+        .ok()?;
+
+    if output.status.success() {
+        String::from_utf8(output.stdout).ok()
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!("Python helper failed: {stderr}");
+        None
     }
 }
 
