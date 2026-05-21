@@ -128,16 +128,34 @@ pub async fn fetch_company_raw(
 // =========================================
 
 #[derive(Debug, Deserialize)]
-struct CookieFile {
-    cookies: Vec<CookieEntry>,
-}
-
-#[derive(Debug, Deserialize)]
 struct CookieEntry {
     name: String,
     value: String,
+    #[serde(default)]
     #[allow(dead_code)]
     domain: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WrappedCookieFile {
+    cookies: Vec<CookieEntry>,
+}
+
+/// Parse cookie file in either format:
+/// - Raw Cookie-Editor export: `[{name, value, domain, ...}, ...]`
+/// - Wrapped format: `{platform: "...", cookies: [{name, value}, ...]}`
+fn parse_cookie_file(content: &str) -> Result<Vec<CookieEntry>, FetchError> {
+    // Try raw array first (Cookie-Editor export)
+    if let Ok(cookies) = serde_json::from_str::<Vec<CookieEntry>>(content) {
+        return Ok(cookies);
+    }
+    // Try wrapped format
+    if let Ok(wrapped) = serde_json::from_str::<WrappedCookieFile>(content) {
+        return Ok(wrapped.cookies);
+    }
+    Err(FetchError::HttpError(
+        "Failed to parse cookie file. Expected either a JSON array from Cookie-Editor export or {\"cookies\": [...]} format.".to_string()
+    ))
 }
 
 pub struct LinkedInClient {
@@ -151,21 +169,18 @@ impl LinkedInClient {
         let content = std::fs::read_to_string(path)
             .map_err(|e| FetchError::HttpError(format!("Failed to read LinkedIn cookie file: {e}")))?;
 
-        let cookie_file: CookieFile = serde_json::from_str(&content)
-            .map_err(|e| FetchError::HttpError(format!("Failed to parse LinkedIn cookie file: {e}")))?;
+        let cookies = parse_cookie_file(&content)?;
 
-        let li_at = cookie_file
-            .cookies
+        let li_at = cookies
             .iter()
             .find(|c| c.name == "li_at")
             .ok_or_else(|| FetchError::HttpError(
-                "LinkedIn cookie expired or missing 'li_at'. Run: forage login linkedin".to_string(),
+                "LinkedIn cookie missing 'li_at'. Re-export cookies from browser.".to_string(),
             ))?
             .value
             .clone();
 
-        let jsessionid = cookie_file
-            .cookies
+        let jsessionid = cookies
             .iter()
             .find(|c| c.name == "JSESSIONID")
             .map(|c| c.value.clone())
@@ -205,18 +220,14 @@ impl LinkedInClient {
             .map_err(|e| FetchError::HttpError(e.to_string()))?;
 
         let status = response.status().as_u16();
-        if status == 401 || status == 403 {
-            return Err(FetchError::HttpError(
-                "LinkedIn cookie expired. Run: forage login linkedin".to_string(),
-            ));
+        if status != 200 {
+            return Err(FetchError::HttpError(format!(
+                "LinkedIn Voyager API returned status {status}"
+            )));
         }
 
         let body = response.text().await
             .map_err(|e| FetchError::HttpError(e.to_string()))?;
-
-        if status != 200 {
-            return Err(FetchError::HttpError(format!("LinkedIn API returned status {status}")));
-        }
 
         parse_voyager_profile(&body, &username)
     }

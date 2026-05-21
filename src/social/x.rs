@@ -170,20 +170,32 @@ fn parse_x_markdown(md: &str, handle: &str) -> XProfile {
 // =========================================
 
 #[derive(Debug, Deserialize)]
-struct CookieFile {
-    cookies: Vec<CookieEntry>,
-}
-
-#[derive(Debug, Deserialize)]
 struct CookieEntry {
     name: String,
     value: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WrappedCookieFile {
+    cookies: Vec<CookieEntry>,
+}
+
+fn parse_cookie_file(content: &str) -> Result<Vec<CookieEntry>, FetchError> {
+    if let Ok(cookies) = serde_json::from_str::<Vec<CookieEntry>>(content) {
+        return Ok(cookies);
+    }
+    if let Ok(wrapped) = serde_json::from_str::<WrappedCookieFile>(content) {
+        return Ok(wrapped.cookies);
+    }
+    Err(FetchError::HttpError(
+        "Failed to parse cookie file. Expected JSON array from Cookie-Editor or {\"cookies\": [...]} format.".to_string()
+    ))
+}
+
 pub struct XClient {
-    auth_token: String,
-    ct0: String,
-    client: reqwest::Client,
+    pub auth_token: String,
+    pub ct0: String,
+    pub client: reqwest::Client,
 }
 
 impl XClient {
@@ -191,21 +203,18 @@ impl XClient {
         let content = std::fs::read_to_string(path)
             .map_err(|e| FetchError::HttpError(format!("Failed to read X cookie file: {e}")))?;
 
-        let cookie_file: CookieFile = serde_json::from_str(&content)
-            .map_err(|e| FetchError::HttpError(format!("Failed to parse X cookie file: {e}")))?;
+        let cookies = parse_cookie_file(&content)?;
 
-        let auth_token = cookie_file
-            .cookies
+        let auth_token = cookies
             .iter()
             .find(|c| c.name == "auth_token")
             .ok_or_else(|| FetchError::HttpError(
-                "X cookie expired or missing 'auth_token'. Run: forage login x".to_string(),
+                "X cookie missing 'auth_token'. Re-export cookies from browser.".to_string(),
             ))?
             .value
             .clone();
 
-        let ct0 = cookie_file
-            .cookies
+        let ct0 = cookies
             .iter()
             .find(|c| c.name == "ct0")
             .map(|c| c.value.clone())
