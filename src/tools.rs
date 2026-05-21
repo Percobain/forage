@@ -601,34 +601,86 @@ fn extract_name_from_title(title: &str) -> String {
 
 /// Run a Python helper script as subprocess and return stdout
 async fn run_python_helper(script: &str, args: &[&str]) -> Option<String> {
-    let script_path = std::env::current_exe().ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .map(|p| p.join("..").join("..").join("python_helpers").join(script))
-        .or_else(|| {
-            // Also check relative to working directory
-            let p = std::path::PathBuf::from("python_helpers").join(script);
-            if p.exists() { Some(p) } else { None }
-        })?;
+    // Search for python_helpers/ directory in multiple locations
+    let candidates: Vec<std::path::PathBuf> = vec![
+        // Relative to exe: target/release/../../python_helpers/
+        std::env::current_exe().ok()
+            .and_then(|p| p.parent()?.parent()?.parent().map(|p| p.join("python_helpers").join(script)))
+            .unwrap_or_default(),
+        // Relative to working directory
+        std::path::PathBuf::from("python_helpers").join(script),
+        // Home config dir
+        dirs::home_dir().map(|h| h.join(".forage").join("python_helpers").join(script)).unwrap_or_default(),
+    ];
 
-    if !script_path.exists() {
-        tracing::debug!("Python helper not found: {}", script_path.display());
-        return None;
-    }
+    let script_path = candidates.iter().find(|p| p.exists())?;
 
-    let output = tokio::process::Command::new("python")
-        .arg(&script_path)
+    tracing::info!("Running Python helper: {} {:?}", script_path.display(), args);
+
+    // Find Python executable
+    let python = find_python();
+
+    let output = tokio::process::Command::new(&python)
+        .arg(script_path)
         .args(args)
+        .env("PYTHONUTF8", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .output()
         .await
         .ok()?;
 
     if output.status.success() {
-        String::from_utf8(output.stdout).ok()
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        if stdout.trim().is_empty() {
+            tracing::warn!("Python helper returned empty output");
+            return None;
+        }
+        Some(stdout)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::warn!("Python helper failed: {stderr}");
         None
     }
+}
+
+fn find_python() -> String {
+    // Check common Python locations
+    let candidates = [
+        "python",
+        "python3",
+        #[cfg(target_os = "windows")]
+        "python.exe",
+    ];
+
+    for cmd in &candidates {
+        if let Ok(output) = std::process::Command::new(cmd).arg("--version").output() {
+            if output.status.success() {
+                return cmd.to_string();
+            }
+        }
+    }
+
+    // Windows: check AppData
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let path = format!("{local}/Programs/Python/Python312/python.exe");
+            if std::path::Path::new(&path).exists() {
+                return path;
+            }
+            // Try other Python versions
+            for ver in &["Python313", "Python311", "Python310"] {
+                let path = format!("{local}/Programs/Python/{ver}/python.exe");
+                if std::path::Path::new(&path).exists() {
+                    return path;
+                }
+            }
+        }
+    }
+
+    "python".to_string()
 }
 
 impl ServerHandler for ForageServer {
