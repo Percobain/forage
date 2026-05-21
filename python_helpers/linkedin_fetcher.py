@@ -105,7 +105,6 @@ def parse_profile_content(data):
     """Extract structured profile info from page text content."""
     content = data.get("content", "")
     title = data.get("title", "")
-    html = data.get("html", "")
     lines = [l.strip() for l in content.split("\n") if l.strip()]
 
     result = {
@@ -119,61 +118,82 @@ def parse_profile_content(data):
         "source": "playwright_stealth",
     }
 
-    # Name from title: "Firstname Lastname - Headline | LinkedIn"
-    if " - " in title and "LinkedIn" in title:
-        parts = title.split(" - ", 1)
-        result["name"] = parts[0].strip()
-        if " | " in parts[1]:
-            result["headline"] = parts[1].split(" | ")[0].strip()
+    # Name from title: "Firstname Lastname | LinkedIn"
+    if " | " in title and "LinkedIn" in title:
+        result["name"] = title.split(" | ")[0].strip()
 
-    # Also try extracting from embedded JSON in HTML
-    import re
-    for match in re.finditer(r"<code[^>]*>(.*?)</code>", html, re.DOTALL):
-        chunk = match.group(1)
-        if "firstName" not in chunk or "lastName" not in chunk:
+    # Parse visible text — LinkedIn's page structure is predictable:
+    # [nav items] → Name → Headline → location → Contact info → org → school → ...
+    # → About → about text → Experience → ... → Education → ...
+
+    skip_nav = {"Home", "My Network", "Jobs", "Messaging", "Notifications", "Me",
+                "For Business", "Skip to main content", "More", "Message", "Connect",
+                "Follow", "He/Him", "She/Her", "They/Them", "Contact info"}
+
+    current_section = ""
+    name_found = False
+
+    for i, line in enumerate(lines):
+        # Skip nav and UI elements
+        if line in skip_nav or line.startswith("0 notification") or line.startswith("Try Premium"):
             continue
-        decoded = chunk.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        try:
-            obj = json.loads(decoded)
-            for item in obj.get("included", []):
-                fn = item.get("firstName", "")
-                ln = item.get("lastName", "")
-                if fn and ln and not result["name"]:
-                    result["name"] = f"{fn} {ln}"
-                hl = item.get("headline", "")
-                if hl and not result["headline"]:
-                    result["headline"] = hl
-                loc = item.get("geoLocationName", "") or item.get("locationName", "")
-                if loc and not result["location"]:
-                    result["location"] = loc
-                summary = item.get("summary", "")
-                if summary and not result["about"]:
-                    result["about"] = summary
-                company = item.get("companyName", "")
-                ttl = item.get("title", "")
-                if company and ttl:
-                    result["experience"].append(f"{ttl} at {company}")
-                school = item.get("schoolName", "")
-                if school:
-                    result["education"].append(school)
-            if result["name"]:
-                break
-        except json.JSONDecodeError:
-            pass
 
-    # Fallback: parse from visible text content
-    if not result["about"]:
-        in_about = False
-        for l in lines:
-            if l == "About":
-                in_about = True
+        # Name is the first non-nav line (appears twice, take first)
+        if not name_found and not result["name"] and len(line) > 2 and len(line) < 80:
+            if not any(kw in line.lower() for kw in ["notification", "skip to", "home", "premium", "business"]):
+                result["name"] = line
+                name_found = True
                 continue
-            if in_about:
-                if l in ("Experience", "Education", "Activity", "Skills"):
-                    break
-                if len(l) > 20:
-                    result["about"] = l
-                    break
+
+        # Headline is right after name (may appear twice, take the longer one)
+        if name_found and not result["headline"] and line != result["name"]:
+            if len(line) > 10 and line not in skip_nav and not line.startswith("He/") and not line.startswith("She/") and not line.startswith("They/"):
+                result["headline"] = line
+                continue
+
+        # Location: "City, State, Country" pattern
+        if name_found and not result["location"]:
+            if any(loc in line for loc in ["India", "United States", "UK", "Canada", "Singapore",
+                                           "Mumbai", "Bangalore", "Delhi", "Pune", "Hyderabad",
+                                           "Gurgaon", "Chennai", "Kolkata", "San Francisco",
+                                           "New York", "London"]):
+                if len(line) < 80:
+                    result["location"] = line
+                    continue
+
+        # Section headers
+        if line == "About":
+            current_section = "about"
+            continue
+        elif line == "Experience":
+            current_section = "experience"
+            continue
+        elif line == "Education":
+            current_section = "education"
+            continue
+        elif line in ("Featured", "Activity", "Skills", "Interests",
+                      "Recommendations", "Courses", "Projects", "Licenses & certifications"):
+            current_section = ""
+            continue
+
+        # Parse sections
+        if current_section == "about" and not result["about"]:
+            if len(line) > 10:
+                result["about"] = line
+                current_section = ""
+
+        elif current_section == "experience":
+            if len(line) > 5 and line not in skip_nav:
+                # Skip dates and durations
+                if not any(kw in line for kw in ["·", "mos", "yrs", "Present"]):
+                    if len(result["experience"]) < 10:
+                        result["experience"].append(line)
+
+        elif current_section == "education":
+            if len(line) > 5 and line not in skip_nav:
+                if not any(kw in line for kw in ["·", "Grade", "GPA"]):
+                    if len(result["education"]) < 5:
+                        result["education"].append(line)
 
     return result
 

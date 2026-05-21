@@ -532,6 +532,11 @@ impl ForageServer {
     // === Lead Generation ===
 
     async fn handle_find_leads(&self, params: FindLeadsParams) -> String {
+        let cache_key = Cache::cache_key("find_leads", &params.company, &params.titles.as_ref().map(|t| t.join(",")).unwrap_or_default());
+        if let Some(entry) = self.cache.get(&cache_key) {
+            return entry.content;
+        }
+
         let titles = params.titles.unwrap_or_else(|| {
             vec![
                 "CEO".into(), "CTO".into(), "Founder".into(), "Co-Founder".into(),
@@ -540,51 +545,51 @@ impl ForageServer {
             ]
         });
 
+        // Tier 1: LinkedIn live browser (best data, verified URLs)
+        // Search company name + top 2 titles for better results
+        let top_titles = if titles.len() > 2 { &titles[..2] } else { &titles };
+        let query = format!("{} {}", params.company, top_titles.join(" "));
+        let limit_str = (params.per_title * 3).to_string(); // fetch extra, dedupe later
+
+        if let Some(result) = run_python_helper("linkedin_live.py", &["search", &query, &limit_str]).await {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&result) {
+                if data.get("people").is_some() || data.get("results").is_some() {
+                    self.cache.put(&cache_key, &params.company, "linkedin_live", &result, Some(200), 3600);
+                    return result;
+                }
+            }
+        }
+
+        // Tier 2: DDG search for LinkedIn profiles
         let mut all_leads = Vec::new();
-
         for title in &titles {
-            if all_leads.len() >= params.per_title * titles.len() {
-                break;
-            }
+            if all_leads.len() >= params.per_title * titles.len() { break; }
 
-            let query = format!("{} {} LinkedIn", params.company, title);
-            let cache_key = Cache::cache_key("find_leads", &query, "");
-
-            let results = if let Some(entry) = self.cache.get(&cache_key) {
-                serde_json::from_str(&entry.content).unwrap_or_default()
-            } else {
-                match search::duckduckgo::search(&query, 10, self.config.fetch.default_timeout_seconds).await {
-                    Ok(r) => {
-                        let json = serde_json::to_string(&r).unwrap_or_default();
-                        self.cache.put(&cache_key, &query, "leads_search", &json, Some(200), 21600);
-                        r
+            let search_query = format!("{} {} LinkedIn", params.company, title);
+            if let Ok(results) = search::duckduckgo::search(&search_query, 10, self.config.fetch.default_timeout_seconds).await {
+                let mut count = 0;
+                for r in &results {
+                    if count >= params.per_title { break; }
+                    if r.url.contains("linkedin.com/in/") {
+                        all_leads.push(serde_json::json!({
+                            "name": extract_name_from_title(&r.title),
+                            "title_searched": title,
+                            "headline": r.title,
+                            "linkedin_url": r.url,
+                            "snippet": r.snippet,
+                            "company": params.company,
+                            "source": "ddg_search",
+                        }));
+                        count += 1;
                     }
-                    Err(_) => vec![],
-                }
-            };
-
-            let mut count = 0;
-            for r in &results {
-                if count >= params.per_title { break; }
-                if r.url.contains("linkedin.com/in/") {
-                    let lead = serde_json::json!({
-                        "name": extract_name_from_title(&r.title),
-                        "title_searched": title,
-                        "headline": r.title,
-                        "linkedin_url": r.url,
-                        "snippet": r.snippet,
-                        "company": params.company,
-                    });
-                    all_leads.push(lead);
-                    count += 1;
                 }
             }
-
-            // Small delay between searches to avoid DDG rate limits
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        serde_json::to_string_pretty(&all_leads).unwrap_or_else(|_| "[]".to_string())
+        let output = serde_json::to_string_pretty(&all_leads).unwrap_or_else(|_| "[]".to_string());
+        self.cache.put(&cache_key, &params.company, "find_leads_ddg", &output, Some(200), 21600);
+        output
     }
 }
 
