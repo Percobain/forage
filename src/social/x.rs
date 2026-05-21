@@ -4,6 +4,171 @@ use crate::rate_limit::PlatformLimiter;
 use serde::Deserialize;
 use std::path::Path;
 
+// =========================================
+// Cookie-free X via Jina Reader
+// =========================================
+
+/// Fetch an X/Twitter profile via Jina Reader (no cookies needed).
+/// Returns profile info parsed from the public page.
+pub async fn fetch_profile_public(
+    handle: &str,
+    timeout_seconds: u64,
+) -> Result<XProfile, FetchError> {
+    let handle = handle.trim_start_matches('@').trim_start_matches("https://x.com/").trim_start_matches("https://twitter.com/").trim_end_matches('/');
+    let url = format!("https://x.com/{handle}");
+    let jina_url = format!("https://r.jina.ai/{url}");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
+        .build()
+        .map_err(|e| FetchError::HttpError(e.to_string()))?;
+
+    let response = client
+        .get(&jina_url)
+        .header("Accept", "text/markdown")
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                FetchError::Timeout(timeout_seconds)
+            } else {
+                FetchError::HttpError(e.to_string())
+            }
+        })?;
+
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(FetchError::HttpError(format!(
+            "Jina returned status {status} for X profile"
+        )));
+    }
+
+    let body = response.text().await
+        .map_err(|e| FetchError::HttpError(e.to_string()))?;
+
+    Ok(parse_x_markdown(&body, handle))
+}
+
+/// Fetch an X profile and return raw markdown for Claude to analyze.
+pub async fn fetch_profile_raw(
+    handle: &str,
+    timeout_seconds: u64,
+) -> Result<String, FetchError> {
+    let handle = handle.trim_start_matches('@').trim_start_matches("https://x.com/").trim_start_matches("https://twitter.com/").trim_end_matches('/');
+    let url = format!("https://x.com/{handle}");
+    let jina_url = format!("https://r.jina.ai/{url}");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
+        .build()
+        .map_err(|e| FetchError::HttpError(e.to_string()))?;
+
+    let response = client
+        .get(&jina_url)
+        .header("Accept", "text/markdown")
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                FetchError::Timeout(timeout_seconds)
+            } else {
+                FetchError::HttpError(e.to_string())
+            }
+        })?;
+
+    let body = response.text().await
+        .map_err(|e| FetchError::HttpError(e.to_string()))?;
+
+    Ok(body)
+}
+
+fn parse_x_markdown(md: &str, handle: &str) -> XProfile {
+    let lines: Vec<&str> = md.lines().collect();
+
+    let mut bio = None;
+    let mut display_name = handle.to_string();
+
+    // Look for the display name and bio
+    for line in &lines {
+        let l = line.trim();
+
+        // Display name is usually in the title
+        if l.starts_with("Title: ") || l.starts_with("# ") {
+            let clean = l.trim_start_matches("Title: ").trim_start_matches("# ");
+            if let Some(name) = clean.split(" (@").next() {
+                if let Some(name) = name.split(" / ").next() {
+                    if !name.is_empty() && name != "X" {
+                        display_name = name.trim().to_string();
+                    }
+                }
+            }
+        }
+
+        // Bio is usually a short line after the handle
+        if bio.is_none() && !l.is_empty() && l.len() > 10 && l.len() < 300
+            && !l.starts_with("[") && !l.starts_with("*") && !l.starts_with("#")
+            && !l.starts_with("Title:") && !l.starts_with("URL ")
+            && !l.starts_with("Markdown") && !l.starts_with("![")
+            && !l.contains("Sign in") && !l.contains("posts")
+            && !l.contains("x.com") && !l.contains("twitter.com")
+            && !l.contains("Square profile") {
+            bio = Some(l.to_string());
+        }
+    }
+
+    // Try to find recent tweets
+    let mut tweets = Vec::new();
+    let mut in_tweet = false;
+    let mut tweet_text = String::new();
+
+    for line in &lines {
+        let l = line.trim();
+        // Tweets often start after profile picture references
+        if l.contains("Square profile picture") {
+            if !tweet_text.is_empty() {
+                tweets.push(Tweet {
+                    text: tweet_text.trim().to_string(),
+                    created_at: None,
+                    likes: None,
+                    retweets: None,
+                });
+                tweet_text.clear();
+            }
+            in_tweet = true;
+            continue;
+        }
+        if in_tweet && !l.is_empty() && !l.starts_with("![") && !l.starts_with("[![")
+            && !l.contains("x.com") && l.len() > 10 {
+            if !tweet_text.is_empty() {
+                tweet_text.push(' ');
+            }
+            tweet_text.push_str(l);
+        }
+    }
+    if !tweet_text.is_empty() && tweets.len() < 20 {
+        tweets.push(Tweet {
+            text: tweet_text.trim().to_string(),
+            created_at: None,
+            likes: None,
+            retweets: None,
+        });
+    }
+
+    XProfile {
+        handle: handle.to_string(),
+        bio,
+        followers: None,
+        following: None,
+        recent_tweets: tweets,
+    }
+}
+
+// =========================================
+// Cookie-based X via GraphQL API
+// =========================================
+
 #[derive(Debug, Deserialize)]
 struct CookieFile {
     cookies: Vec<CookieEntry>,
@@ -53,118 +218,6 @@ impl XClient {
 
         Ok(Self { auth_token, ct0, client })
     }
-
-    pub async fn fetch_profile(
-        &self,
-        handle: &str,
-        include_tweets: bool,
-        tweet_count: usize,
-        limiter: &PlatformLimiter,
-    ) -> Result<XProfile, FetchError> {
-        limiter.acquire().await.map_err(|e| FetchError::HttpError(e.to_string()))?;
-
-        let handle = handle.trim_start_matches('@');
-
-        // Use X's GraphQL UserByScreenName endpoint
-        let variables = serde_json::json!({
-            "screen_name": handle,
-            "withSafetyModeUserFields": true
-        });
-        let features = serde_json::json!({
-            "hidden_profile_subscriptions_enabled": true,
-            "rweb_tipjar_consumption_enabled": true,
-            "responsive_web_graphql_exclude_directive_enabled": true,
-            "verified_phone_label_enabled": false,
-            "highlights_tweets_tab_ui_enabled": true,
-            "responsive_web_twitter_article_notes_tab_enabled": true,
-            "subscriptions_feature_can_gift_premium": true,
-            "creator_subscriptions_tweet_preview_api_enabled": true,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": false,
-            "responsive_web_graphql_timeline_navigation_enabled": true
-        });
-
-        let url = format!(
-            "https://x.com/i/api/graphql/xmU6X_CKVnQ5lSrCbAmJsg/UserByScreenName?variables={}&features={}",
-            urlencoding::encode(&variables.to_string()),
-            urlencoding::encode(&features.to_string()),
-        );
-
-        let response = self.client
-            .get(&url)
-            .header("cookie", format!("auth_token={}; ct0={}", self.auth_token, self.ct0))
-            .header("x-csrf-token", &self.ct0)
-            .header("authorization", "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA")
-            .header("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            .header("content-type", "application/json")
-            .send()
-            .await
-            .map_err(|e| FetchError::HttpError(e.to_string()))?;
-
-        let status = response.status().as_u16();
-        if status == 401 || status == 403 {
-            return Err(FetchError::HttpError(
-                "X cookie expired. Run: forage login x".to_string(),
-            ));
-        }
-
-        let body = response
-            .text()
-            .await
-            .map_err(|e| FetchError::HttpError(e.to_string()))?;
-
-        let mut profile = parse_user_response(&body, handle)?;
-
-        // Fetch tweets if requested
-        if include_tweets {
-            if let Ok(tweets) = self.fetch_tweets(handle, tweet_count, limiter).await {
-                profile.recent_tweets = tweets;
-            }
-        }
-
-        Ok(profile)
-    }
-
-    async fn fetch_tweets(
-        &self,
-        handle: &str,
-        count: usize,
-        limiter: &PlatformLimiter,
-    ) -> Result<Vec<Tweet>, FetchError> {
-        limiter.acquire().await.map_err(|e| FetchError::HttpError(e.to_string()))?;
-
-        // Use UserTweets GraphQL endpoint
-        // Note: user_id is needed; for simplicity we'll return empty if we can't get it
-        // In a full implementation, we'd extract rest_id from the profile response
-        Ok(vec![])
-    }
-}
-
-fn parse_user_response(body: &str, handle: &str) -> Result<XProfile, FetchError> {
-    let json: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| FetchError::HttpError(format!("Failed to parse X response: {e}")))?;
-
-    let user_result = json
-        .pointer("/data/user/result")
-        .or_else(|| json.pointer("/data/user"));
-
-    let (bio, followers, following) = if let Some(user) = user_result {
-        let legacy = user.get("legacy").unwrap_or(user);
-        (
-            legacy.get("description").and_then(|v| v.as_str()).map(String::from),
-            legacy.get("followers_count").and_then(|v| v.as_u64()),
-            legacy.get("friends_count").and_then(|v| v.as_u64()),
-        )
-    } else {
-        (None, None, None)
-    };
-
-    Ok(XProfile {
-        handle: handle.to_string(),
-        bio,
-        followers,
-        following,
-        recent_tweets: vec![],
-    })
 }
 
 #[cfg(test)]
@@ -172,11 +225,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_user_response_empty() {
-        let body = r#"{"data":{"user":{"result":{"legacy":{"description":"test bio","followers_count":100,"friends_count":50}}}}}"#;
-        let profile = parse_user_response(body, "test").unwrap();
-        assert_eq!(profile.bio, Some("test bio".to_string()));
-        assert_eq!(profile.followers, Some(100));
-        assert_eq!(profile.following, Some(50));
+    fn test_parse_x_markdown() {
+        let md = "Title: Razorpay (@Razorpay) / X\n\nURL Source: https://x.com/razorpay\n\nBacking India's Boldest Founders. Join the movement\n\n## Razorpay's posts\n";
+        let profile = parse_x_markdown(md, "razorpay");
+        assert_eq!(profile.handle, "razorpay");
+        assert_eq!(profile.bio, Some("Backing India's Boldest Founders. Join the movement".to_string()));
     }
 }
